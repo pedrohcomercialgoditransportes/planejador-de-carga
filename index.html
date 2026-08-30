@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Planejador de Carga</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body, #root { height: 100%; margin: 0; }
+  body { background: #0b131c; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo } = React;
+
+// ---- localStorage-backed polyfill for the artifact storage API ----
+window.storage = {
+  async get(key) {
+    const raw = localStorage.getItem('cargo-planner:' + key);
+    if (raw === null) { const e = new Error('not found'); throw e; }
+    return { key, value: raw, shared: false };
+  },
+  async set(key, value) {
+    localStorage.setItem('cargo-planner:' + key, value);
+    return { key, value, shared: false };
+  },
+  async delete(key) {
+    localStorage.removeItem('cargo-planner:' + key);
+    return { key, deleted: true, shared: false };
+  },
+  async list(prefix) {
+    const p = 'cargo-planner:' + (prefix || '');
+    const keys = Object.keys(localStorage).filter((k) => k.startsWith(p)).map((k) => k.slice('cargo-planner:'.length));
+    return { keys, shared: false };
+  },
+};
+
+// ---- tiny inline-icon stand-ins (no external icon package needed) ----
+function IconBase({ children, size = 16, color = 'currentColor', style }) {
+  return <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: size, lineHeight: 1, color, ...style }}>{children}</span>;
+}
+const Truck = (p) => <IconBase {...p}>🚚</IconBase>;
+const Plus = (p) => <IconBase {...p}>+</IconBase>;
+const Trash2 = (p) => <IconBase {...p}>🗑</IconBase>;
+const RotateCcw = (p) => <IconBase {...p}>↺</IconBase>;
+const Layers = (p) => <IconBase {...p}>▦</IconBase>;
+const AlertTriangle = (p) => <IconBase {...p}>⚠</IconBase>;
+const BoxIcon = (p) => <IconBase {...p}>📦</IconBase>;
+const Move3d = (p) => <IconBase {...p}>🧊</IconBase>;
+const Ruler = (p) => <IconBase {...p}>📐</IconBase>;
+const Pencil = (p) => <IconBase {...p}>✎</IconBase>;
+const Save = (p) => <IconBase {...p}>💾</IconBase>;
+const X = (p) => <IconBase {...p}>✕</IconBase>;
+
+const PALETTE = ['#ff7a33', '#6fb7e0', '#ffd166', '#8f6fe0', '#4fd6a8', '#f0698f', '#e0a458', '#7fd3ff'];
+
+const COLORS = {
+  bg: '#0b131c',
+  panel: '#111d29',
+  panelAlt: '#0e1822',
+  line: '#26404f',
+  lineBright: '#3f6c85',
+  cyan: '#7fd3ff',
+  text: '#e7f1f7',
+  textDim: '#7d95a6',
+  accent: '#ff7a33',
+  accent2: '#ffd166',
+  danger: '#ff5c5c',
+  ok: '#4fd6a8',
+};
+
+// ---------- Packing algorithm: greedy shelf-based 3D bin packing ----------
+function packTruck(truck, boxTypes) {
+  const instances = [];
+  boxTypes.forEach((bt) => {
+    for (let i = 0; i < bt.qty; i++) {
+      instances.push({ typeId: bt.id, name: bt.name, L: bt.L, W: bt.W, H: bt.H, color: bt.color, weight: bt.weight || 0 });
+    }
+  });
+  instances.sort((a, b) => b.H - a.H || b.L * b.W - a.L * a.W);
+
+  let remaining = [...instances];
+  const placed = [];
+  let z = 0;
+  const EPS = 0.01;
+  let guard = 0;
+
+  while (remaining.length > 0 && z < truck.H - EPS && guard < 500) {
+    guard++;
+    let layerHeight = 0;
+    let cursorY = 0;
+    let layerProgressed = true;
+
+    while (cursorY < truck.W - EPS && remaining.length > 0 && layerProgressed) {
+      layerProgressed = false;
+      let cursorX = 0;
+      let rowDepth = 0;
+
+      for (let i = 0; i < remaining.length; i++) {
+        const item = remaining[i];
+        if (z + item.H <= truck.H + EPS && cursorX + item.L <= truck.L + EPS && cursorY + item.W <= truck.W + EPS) {
+          placed.push({ ...item, x: cursorX, y: cursorY, z, id: placed.length });
+          cursorX += item.L;
+          rowDepth = Math.max(rowDepth, item.W);
+          layerHeight = Math.max(layerHeight, item.H);
+          remaining.splice(i, 1);
+          i--;
+          layerProgressed = true;
+        }
+      }
+      if (rowDepth > 0) cursorY += rowDepth;
+      else break;
+    }
+    if (layerHeight === 0) break;
+    z += layerHeight;
+  }
+  return { placed, unplaced: remaining };
+}
+
+function fmt(n) {
+  return Number(n.toFixed(2)).toLocaleString('pt-BR');
+}
+
+// ---------- 3D view (custom orbit, no OrbitControls dependency) ----------
+function ThreeView({ truck, placed, occupiedLength, knowTruck }) {
+  const mountRef = useRef(null);
+  const stateRef = useRef({});
+
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount) return;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(COLORS.panelAlt);
+
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100000);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    mount.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+    const dLight = new THREE.DirectionalLight(0xffffff, 0.9);
+    dLight.position.set(1, 2, 1);
+    scene.add(dLight);
+    const dLight2 = new THREE.DirectionalLight(0xffffff, 0.35);
+    dLight2.position.set(-1, 1, -1);
+    scene.add(dLight2);
+
+    const boxGroup = new THREE.Group();
+    scene.add(boxGroup);
+    let truckLines = null;
+    let grid = null;
+    let occMesh = null;
+
+    const orbit = { theta: Math.PI * 0.28, phi: Math.PI * 0.36, radius: 100, target: new THREE.Vector3(0, 0, 0), dragging: false, lastX: 0, lastY: 0 };
+
+    function updateCamera() {
+      const { theta, phi, radius, target } = orbit;
+      camera.position.set(
+        target.x + radius * Math.sin(phi) * Math.sin(theta),
+        target.y + radius * Math.cos(phi),
+        target.z + radius * Math.sin(phi) * Math.cos(theta)
+      );
+      camera.lookAt(target);
+    }
+
+    function onPointerDown(e) {
+      orbit.dragging = true;
+      orbit.lastX = e.clientX;
+      orbit.lastY = e.clientY;
+    }
+    function onPointerMove(e) {
+      if (!orbit.dragging) return;
+      const dx = e.clientX - orbit.lastX;
+      const dy = e.clientY - orbit.lastY;
+      orbit.theta -= dx * 0.0055;
+      orbit.phi -= dy * 0.0055;
+      orbit.phi = Math.max(0.15, Math.min(Math.PI - 0.15, orbit.phi));
+      orbit.lastX = e.clientX;
+      orbit.lastY = e.clientY;
+      updateCamera();
+    }
+    function onPointerUp() {
+      orbit.dragging = false;
+    }
+    function onWheel(e) {
+      e.preventDefault();
+      orbit.radius *= 1 + e.deltaY * 0.001;
+      orbit.radius = Math.max(20, Math.min(100000, orbit.radius));
+      updateCamera();
+    }
+
+    renderer.domElement.style.touchAction = 'none';
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    renderer.domElement.addEventListener('wheel', onWheel, { passive: false });
+
+    function resize() {
+      const w = mount.clientWidth || 1;
+      const h = mount.clientHeight || 1;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    }
+    const ro = new ResizeObserver(resize);
+    ro.observe(mount);
+    resize();
+
+    let raf;
+    function animate() {
+      raf = requestAnimationFrame(animate);
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    stateRef.current = {
+      scene, camera, renderer, boxGroup, orbit, updateCamera,
+      getTruckLines: () => truckLines, setTruckLines: (v) => (truckLines = v),
+      getGrid: () => grid, setGrid: (v) => (grid = v),
+      getOcc: () => occMesh, setOcc: (v) => (occMesh = v),
+    };
+
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+      renderer.domElement.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      renderer.domElement.removeEventListener('wheel', onWheel);
+      mount.removeChild(renderer.domElement);
+      renderer.dispose();
+    };
+  }, []);
+
+  // rebuild truck + boxes whenever data changes
+  useEffect(() => {
+    const s = stateRef.current;
+    if (!s || !s.scene) return;
+    const { scene, boxGroup, orbit, updateCamera } = s;
+
+    while (boxGroup.children.length) {
+      const c = boxGroup.children.pop();
+      c.geometry?.dispose();
+      c.material?.dispose && c.material.dispose();
+    }
+    const old = s.getTruckLines();
+    if (old) {
+      scene.remove(old);
+      old.geometry.dispose();
+      old.material.dispose();
+    }
+    const oldGrid = s.getGrid();
+    if (oldGrid) scene.remove(oldGrid);
+    const oldOcc = s.getOcc && s.getOcc();
+    if (oldOcc) {
+      scene.remove(oldOcc);
+      oldOcc.geometry?.dispose();
+      oldOcc.material?.dispose();
+    }
+
+    const maxX = placed.length ? Math.max(...placed.map((b) => b.x + b.L)) : 0;
+    const maxZ = placed.length ? Math.max(...placed.map((b) => b.z + b.H)) : 0;
+    const L = knowTruck ? truck.L : Math.max(100, maxX + 40);
+    const W = truck.W;
+    const H = knowTruck ? truck.H : Math.max(50, maxZ + 40);
+    if (!L || !W || !H) return;
+
+    if (knowTruck && occupiedLength > 0) {
+      const occLen = Math.min(occupiedLength, L);
+      const occGeo = new THREE.BoxGeometry(occLen, H, W);
+      const occMat = new THREE.MeshStandardMaterial({ color: '#4a5a66', transparent: true, opacity: 0.4, roughness: 0.9 });
+      const occMesh2 = new THREE.Mesh(occGeo, occMat);
+      occMesh2.position.set(occLen / 2 - L / 2, H / 2, 0);
+      scene.add(occMesh2);
+      s.setOcc && s.setOcc(occMesh2);
+    } else {
+      s.setOcc && s.setOcc(null);
+    }
+
+    const truckGeo = new THREE.BoxGeometry(L, H, W);
+    const edges = new THREE.EdgesGeometry(truckGeo);
+    const lines = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: knowTruck ? COLORS.cyan : COLORS.textDim, transparent: true, opacity: knowTruck ? 0.85 : 0.5 }));
+    lines.position.set(0, H / 2, 0);
+    scene.add(lines);
+    s.setTruckLines(lines);
+    truckGeo.dispose();
+
+    const gridSize = Math.max(L, W) * 1.4;
+    const divisions = Math.max(6, Math.round(gridSize / Math.max(20, Math.max(L, W) / 12)));
+    const gridHelper = new THREE.GridHelper(gridSize, divisions, COLORS.line, COLORS.line);
+    gridHelper.position.set(0, 0, 0);
+    scene.add(gridHelper);
+    s.setGrid(gridHelper);
+
+    placed.forEach((b) => {
+      const geo = new THREE.BoxGeometry(b.L, b.H, b.W);
+      const mat = new THREE.MeshStandardMaterial({ color: b.color, transparent: true, opacity: 0.88, roughness: 0.6, metalness: 0.05 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(b.x + b.L / 2 - L / 2, b.z + b.H / 2, b.y + b.W / 2 - W / 2);
+      boxGroup.add(mesh);
+
+      const edgeGeo = new THREE.EdgesGeometry(geo);
+      const edgeLines = new THREE.LineSegments(edgeGeo, new THREE.LineBasicMaterial({ color: '#0b131c', transparent: true, opacity: 0.5 }));
+      edgeLines.position.copy(mesh.position);
+      boxGroup.add(edgeLines);
+    });
+
+    orbit.radius = Math.max(L, W, H) * 1.9 + 40;
+    orbit.target.set(0, H / 2, 0);
+    updateCamera();
+  }, [truck, placed, occupiedLength, knowTruck]);
+
+  return <div ref={mountRef} style={{ width: '100%', height: '100%', cursor: 'grab' }} />;
+}
+
+// ---------- 2D top-down view: drag a box onto another to stack it ----------
+function FloorPlan({ truck, placed, setPlaced, occupiedLength, knowTruck }) {
+  const svgRef = useRef(null);
+  const dragRef = useRef(null);
+  const [draggingId, setDraggingId] = useState(null);
+  const [dragTargetId, setDragTargetId] = useState(null);
+
+  const neededLength = placed.length ? Math.max(...placed.map((b) => b.x + b.L)) : 0;
+  const floorL = knowTruck ? truck.L : Math.max(300, neededLength + 150);
+  const floorW = truck.W;
+
+  const toSvgPoint = (clientX, clientY) => {
+    const svg = svgRef.current;
+    const pt = svg.createSVGPoint();
+    pt.x = clientX;
+    pt.y = clientY;
+    return pt.matrixTransform(svg.getScreenCTM().inverse());
+  };
+
+  const findStackTarget = (box, bx, by) => {
+    const cx = bx + box.L / 2;
+    const cy = by + box.W / 2;
+    let best = null;
+    for (const other of placed) {
+      if (other.id === box.id) continue;
+      if (cx >= other.x && cx <= other.x + other.L && cy >= other.y && cy <= other.y + other.W) {
+        if (!best || other.z + other.H > best.z + best.H) best = other;
+      }
+    }
+    return best;
+  };
+
+  const rotateBox = (box) => {
+    setPlaced((prev) =>
+      prev.map((p) => {
+        if (p.id !== box.id) return p;
+        const newL = p.W, newW = p.L;
+        const nx = Math.max(0, Math.min(Math.max(floorL - newL, 0), p.x));
+        const ny = Math.max(0, Math.min(Math.max(floorW - newW, 0), p.y));
+        return { ...p, L: newL, W: newW, x: nx, y: ny };
+      })
+    );
+  };
+
+  const onPointerDown = (e, box) => {
+    e.stopPropagation();
+    e.target.setPointerCapture(e.pointerId);
+    const p = toSvgPoint(e.clientX, e.clientY);
+    dragRef.current = { id: box.id, offX: p.x - box.x, offY: p.y - box.y };
+    setDraggingId(box.id);
+  };
+
+  const onPointerMove = (e) => {
+    if (!dragRef.current) return;
+    const p = toSvgPoint(e.clientX, e.clientY);
+    const dragId = dragRef.current.id;
+    const box = placed.find((b) => b.id === dragId);
+    if (!box) return;
+    const nx = Math.max(0, Math.min(Math.max(floorL - box.L, 0), p.x - dragRef.current.offX));
+    const ny = Math.max(0, Math.min(Math.max(floorW - box.W, 0), p.y - dragRef.current.offY));
+    setPlaced((prev) => prev.map((b) => (b.id === dragId ? { ...b, x: nx, y: ny } : b)));
+    const target = findStackTarget(box, nx, ny);
+    setDragTargetId(target ? target.id : null);
+  };
+
+  const onPointerUp = () => {
+    if (dragRef.current) {
+      const dragId = dragRef.current.id;
+      setPlaced((prev) => {
+        const box = prev.find((b) => b.id === dragId);
+        if (!box) return prev;
+        const target = findStackTarget(box, box.x, box.y);
+        const newZ = target ? target.z + target.H : 0;
+        return prev.map((b) => (b.id === dragId ? { ...b, z: newZ } : b));
+      });
+    }
+    dragRef.current = null;
+    setDraggingId(null);
+    setDragTargetId(null);
+  };
+
+  const sorted = [...placed].sort((a, b) => a.z - b.z);
+
+  return (
+    <svg
+      ref={svgRef}
+      viewBox={`-8 -8 ${floorL + 16} ${floorW + 16}`}
+      style={{ width: '100%', height: '100%', touchAction: 'none' }}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerLeave={onPointerUp}
+    >
+      <rect x={-8} y={-8} width={floorL + 16} height={floorW + 16} fill={COLORS.panelAlt} />
+      {knowTruck ? (
+        <rect x={0} y={0} width={truck.L} height={truck.W} fill="none" stroke={COLORS.cyan} strokeWidth={2} vectorEffect="non-scaling-stroke" />
+      ) : (
+        <rect x={0} y={0} width={floorL} height={floorW} fill="none" stroke={COLORS.textDim} strokeDasharray="10 6" strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
+      )}
+      {knowTruck && occupiedLength > 0 && (
+        <g>
+          <defs>
+            <pattern id="hatchOcc" patternUnits="userSpaceOnUse" width={Math.max(6, truck.L * 0.015)} height={Math.max(6, truck.L * 0.015)} patternTransform="rotate(45)">
+              <line x1={0} y1={0} x2={0} y2={Math.max(6, truck.L * 0.015)} stroke={COLORS.textDim} strokeWidth={Math.max(1, truck.L * 0.002)} />
+            </pattern>
+          </defs>
+          <rect x={0} y={0} width={Math.min(occupiedLength, truck.L)} height={truck.W} fill="url(#hatchOcc)" fillOpacity={0.5} />
+          <text x={Math.min(occupiedLength, truck.L) / 2} y={truck.W / 2} fontSize={Math.min(truck.L, truck.W) * 0.06} fill={COLORS.textDim} textAnchor="middle" dominantBaseline="middle" fontFamily="ui-monospace, monospace" fontWeight="700">
+            carga já embarcada
+          </text>
+        </g>
+      )}
+      {sorted.map((b) => {
+        const iconR = Math.max(9, Math.min(b.L, b.W) * 0.22);
+        return (
+          <g key={b.id} opacity={draggingId === b.id ? 0.75 : 1}>
+            <g onPointerDown={(e) => onPointerDown(e, b)} style={{ cursor: 'grab' }}>
+              <rect
+                x={b.x} y={b.y} width={b.L} height={b.W}
+                fill={b.color} fillOpacity={0.88}
+                stroke={dragTargetId === b.id ? COLORS.accent2 : '#0b131c'}
+                strokeWidth={dragTargetId === b.id ? 3 : 1.5}
+                vectorEffect="non-scaling-stroke" rx={2}
+              />
+              <text x={b.x + b.L / 2} y={b.y + b.W / 2 - Math.min(b.L, b.W) * 0.14} fontSize={Math.min(b.L, b.W) * 0.2} fill="#0b131c" textAnchor="middle" dominantBaseline="middle" fontFamily="ui-monospace, monospace" fontWeight="700" style={{ pointerEvents: 'none' }}>
+                {b.name}
+              </text>
+              <text x={b.x + b.L / 2} y={b.y + b.W / 2 + Math.min(b.L, b.W) * 0.16} fontSize={Math.min(b.L, b.W) * 0.14} fill="#0b131c" textAnchor="middle" dominantBaseline="middle" fontFamily="ui-monospace, monospace" style={{ pointerEvents: 'none' }} opacity={0.75}>
+                {Math.round(b.z)}–{Math.round(b.z + b.H)}cm
+              </text>
+            </g>
+            <g
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => { e.stopPropagation(); rotateBox(b); }}
+              style={{ cursor: 'pointer' }}
+            >
+              <circle cx={b.x + b.L - iconR * 0.9} cy={b.y + iconR * 0.9} r={iconR * 0.62} fill="#0b131c" fillOpacity={0.88} stroke={COLORS.cyan} strokeWidth={1} vectorEffect="non-scaling-stroke" />
+              <text x={b.x + b.L - iconR * 0.9} y={b.y + iconR * 0.9} fontSize={iconR * 0.75} fill={COLORS.cyan} textAnchor="middle" dominantBaseline="central" style={{ pointerEvents: 'none' }}>⟳</text>
+            </g>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ---------- Main app ----------
+function CargoPlanner() {
+  const [truck, setTruck] = useState({ L: 1360, W: 245, H: 270, maxWeight: 27000, knowTruck: true, shipmentType: 'dedicado', occupiedLength: 0, occupiedWeight: 0 });
+  const [boxTypes, setBoxTypes] = useState([]);
+  const [placed, setPlaced] = useState([]);
+  const [unplaced, setUnplaced] = useState([]);
+  const [view, setView] = useState('3d');
+  const [loaded, setLoaded] = useState(false);
+  const nextId = useRef(1);
+
+  const [form, setForm] = useState({ name: '', L: '', W: '', H: '', qty: '', weight: '' });
+  const [editingId, setEditingId] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const t = await window.storage.get('truck-config');
+        if (t?.value) setTruck((prev) => ({ ...prev, ...JSON.parse(t.value) }));
+      } catch (e) {}
+      try {
+        const bt = await window.storage.get('box-types');
+        if (bt?.value) {
+          const parsed = JSON.parse(bt.value);
+          setBoxTypes(parsed);
+          nextId.current = parsed.reduce((m, b) => Math.max(m, b.id), 0) + 1;
+        }
+      } catch (e) {}
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => {
+      window.storage.set('truck-config', JSON.stringify(truck)).catch(() => {});
+      window.storage.set('box-types', JSON.stringify(boxTypes)).catch(() => {});
+    }, 400);
+    return () => clearTimeout(t);
+  }, [truck, boxTypes, loaded]);
+
+  const submitBoxType = () => {
+    const L = parseFloat(form.L), W = parseFloat(form.W), H = parseFloat(form.H), qty = parseInt(form.qty, 10);
+    if (!form.name.trim() || !L || !W || !H || !qty) return;
+    if (editingId != null) {
+      setBoxTypes((prev) => prev.map((b) => (b.id === editingId ? { ...b, name: form.name.trim(), L, W, H, qty, weight: parseFloat(form.weight) || 0 } : b)));
+      setEditingId(null);
+    } else {
+      const bt = {
+        id: nextId.current++,
+        name: form.name.trim(),
+        L, W, H, qty,
+        weight: parseFloat(form.weight) || 0,
+        color: PALETTE[boxTypes.length % PALETTE.length],
+      };
+      setBoxTypes((prev) => [...prev, bt]);
+    }
+    setForm({ name: '', L: '', W: '', H: '', qty: '', weight: '' });
+  };
+
+  const startEditBoxType = (bt) => {
+    setForm({ name: bt.name, L: String(bt.L), W: String(bt.W), H: String(bt.H), qty: String(bt.qty), weight: bt.weight ? String(bt.weight) : '' });
+    setEditingId(bt.id);
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setForm({ name: '', L: '', W: '', H: '', qty: '', weight: '' });
+  };
+
+  const removeBoxType = (id) => {
+    setBoxTypes((prev) => prev.filter((b) => b.id !== id));
+    if (editingId === id) cancelEdit();
+  };
+
+  const occLen = truck.knowTruck && truck.shipmentType === 'fracionado' ? Math.min(truck.occupiedLength || 0, truck.L) : 0;
+  const occWeight = truck.knowTruck && truck.shipmentType === 'fracionado' ? truck.occupiedWeight || 0 : 0;
+
+  const autoArrange = () => {
+    const Ldim = truck.knowTruck ? truck.L : 999999;
+    const effTruck = { L: Math.max(0, Ldim - occLen), W: truck.W, H: truck.H };
+    const { placed: p, unplaced: u } = packTruck(effTruck, boxTypes);
+    setPlaced(p.map((b) => ({ ...b, x: b.x + occLen })));
+    setUnplaced(u);
+  };
+
+  const resetAll = () => {
+    setBoxTypes([]);
+    setPlaced([]);
+    setUnplaced([]);
+  };
+
+  const neededLength = placed.length ? Math.max(...placed.map((b) => b.x + b.L)) : 0;
+  const useNeededAsTruck = () => {
+    const rounded = Math.ceil(neededLength / 10) * 10;
+    setTruck((t) => ({ ...t, L: rounded, knowTruck: true }));
+  };
+
+  const truckVolume = truck.knowTruck ? (truck.L * truck.W * truck.H) / 1e6 : 0;
+  const occVolume = (occLen * truck.W * truck.H) / 1e6;
+  const usedVolume = placed.reduce((s, b) => s + (b.L * b.W * b.H) / 1e6, 0);
+  const utilization = truckVolume > 0 ? Math.min(100, ((usedVolume + occVolume) / truckVolume) * 100) : 0;
+  const totalWeight = occWeight + placed.reduce((s, b) => s + b.weight, 0);
+  const showWeightLimit = truck.knowTruck && truck.maxWeight > 0;
+  const weightPct = showWeightLimit ? Math.min(100, (totalWeight / truck.maxWeight) * 100) : 0;
+
+  return (
+    <div style={{ background: COLORS.bg, color: COLORS.text, fontFamily: "Inter, system-ui, -apple-system, 'Segoe UI', sans-serif", width: '100%', height: '100%', minHeight: 640, display: 'flex', flexDirection: 'column' }}>
+      <style>{`
+        .cp-input { background:${COLORS.panelAlt}; border:1px solid ${COLORS.line}; color:${COLORS.text}; border-radius:4px; padding:6px 8px; font-family: ui-monospace, 'IBM Plex Mono', Menlo, monospace; font-size:13px; width:100%; }
+        .cp-input:focus { outline:none; border-color:${COLORS.cyan}; }
+        .cp-label { font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:${COLORS.textDim}; margin-bottom:4px; display:block; }
+        .cp-btn { display:flex; align-items:center; gap:6px; justify-content:center; border-radius:4px; padding:8px 12px; font-size:13px; font-weight:600; cursor:pointer; border:1px solid transparent; transition: filter .15s; }
+        .cp-btn:hover { filter:brightness(1.1); }
+        .cp-scroll::-webkit-scrollbar { width:8px; height:8px; }
+        .cp-scroll::-webkit-scrollbar-thumb { background:${COLORS.line}; border-radius:4px; }
+        .cp-tab { padding:7px 14px; font-size:12px; font-weight:700; letter-spacing:.03em; border-radius:4px 4px 0 0; cursor:pointer; border:1px solid ${COLORS.line}; border-bottom:none; }
+      `}</style>
+
+      {/* header */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '14px 20px', borderBottom: `1px solid ${COLORS.line}`, background: COLORS.panel }}>
+        <div style={{ width: 34, height: 34, borderRadius: 6, background: COLORS.accent, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <Truck size={19} color="#0b131c" />
+        </div>
+        <div>
+          <div style={{ fontSize: 15, fontWeight: 800, letterSpacing: '.01em' }}>Planejador de Carga</div>
+          <div style={{ fontSize: 11, color: COLORS.textDim, fontFamily: 'ui-monospace, monospace' }}>esboço de cubagem · não substitui cálculo de engenharia</div>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+        {/* sidebar */}
+        <div className="cp-scroll" style={{ width: 300, minWidth: 300, borderRight: `1px solid ${COLORS.line}`, background: COLORS.panel, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 18 }}>
+          {/* truck config */}
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 800, color: COLORS.cyan, letterSpacing: '.08em', marginBottom: 8, textTransform: 'uppercase' }}>Baú / Caminhão</div>
+
+            <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+              <div
+                className="cp-btn"
+                style={{ flex: 1, padding: '6px 8px', background: truck.knowTruck ? COLORS.accent : COLORS.panelAlt, color: truck.knowTruck ? '#0b131c' : COLORS.textDim, border: `1px solid ${COLORS.line}` }}
+                onClick={() => setTruck({ ...truck, knowTruck: true })}
+              >
+                Caminhão definido
+              </div>
+              <div
+                className="cp-btn"
+                style={{ flex: 1, padding: '6px 8px', background: !truck.knowTruck ? COLORS.accent : COLORS.panelAlt, color: !truck.knowTruck ? '#0b131c' : COLORS.textDim, border: `1px solid ${COLORS.line}` }}
+                onClick={() => setTruck({ ...truck, knowTruck: false })}
+              >
+                Pré-medida
+              </div>
+            </div>
+
+            {!truck.knowTruck && (
+              <div style={{ fontSize: 11, color: COLORS.textDim, marginBottom: 8, lineHeight: 1.4 }}>
+                Monte a carga com uma largura/altura de referência. Depois é só clicar em "usar essa medida" pra definir o comprimento real do caminhão.
+              </div>
+            )}
+
+            {truck.knowTruck ? (
+              <>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }}>
+                  <div>
+                    <span className="cp-label">Comprimento</span>
+                    <input className="cp-input" type="number" value={truck.L} onChange={(e) => setTruck({ ...truck, L: parseFloat(e.target.value) || 0 })} />
+                  </div>
+                  <div>
+                    <span className="cp-label">Largura</span>
+                    <input className="cp-input" type="number" value={truck.W} onChange={(e) => setTruck({ ...truck, W: parseFloat(e.target.value) || 0 })} />
+                  </div>
+                  <div>
+                    <span className="cp-label">Altura</span>
+                    <input className="cp-input" type="number" value={truck.H} onChange={(e) => setTruck({ ...truck, H: parseFloat(e.target.value) || 0 })} />
+                  </div>
+                  <div>
+                    <span className="cp-label">Peso máx. (kg)</span>
+                    <input className="cp-input" type="number" value={truck.maxWeight} onChange={(e) => setTruck({ ...truck, maxWeight: parseFloat(e.target.value) || 0 })} />
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: 6, marginBottom: truck.shipmentType === 'fracionado' ? 8 : 0 }}>
+                  <div
+                    className="cp-btn"
+                    style={{ flex: 1, padding: '6px 8px', background: truck.shipmentType === 'dedicado' ? COLORS.accent : COLORS.panelAlt, color: truck.shipmentType === 'dedicado' ? '#0b131c' : COLORS.textDim, border: `1px solid ${COLORS.line}` }}
+                    onClick={() => setTruck({ ...truck, shipmentType: 'dedicado' })}
+                  >
+                    Dedicado
+                  </div>
+                  <div
+                    className="cp-btn"
+                    style={{ flex: 1, padding: '6px 8px', background: truck.shipmentType === 'fracionado' ? COLORS.accent : COLORS.panelAlt, color: truck.shipmentType === 'fracionado' ? '#0b131c' : COLORS.textDim, border: `1px solid ${COLORS.line}` }}
+                    onClick={() => setTruck({ ...truck, shipmentType: 'fracionado' })}
+                  >
+                    Fracionado (complemento)
+                  </div>
+                </div>
+
+                {truck.shipmentType === 'fracionado' && (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, background: COLORS.panelAlt, border: `1px solid ${COLORS.line}`, borderRadius: 4, padding: 8 }}>
+                    <div>
+                      <span className="cp-label">Comprim. já ocupado (cm)</span>
+                      <input className="cp-input" type="number" value={truck.occupiedLength} onChange={(e) => setTruck({ ...truck, occupiedLength: parseFloat(e.target.value) || 0 })} />
+                    </div>
+                    <div>
+                      <span className="cp-label">Peso já embarcado (kg)</span>
+                      <input className="cp-input" type="number" value={truck.occupiedWeight} onChange={(e) => setTruck({ ...truck, occupiedWeight: parseFloat(e.target.value) || 0 })} />
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <div>
+                  <span className="cp-label">Largura de referência</span>
+                  <input className="cp-input" type="number" value={truck.W} onChange={(e) => setTruck({ ...truck, W: parseFloat(e.target.value) || 0 })} />
+                </div>
+                <div>
+                  <span className="cp-label">Altura de referência</span>
+                  <input className="cp-input" type="number" value={truck.H} onChange={(e) => setTruck({ ...truck, H: parseFloat(e.target.value) || 0 })} />
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* add box type */}
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 800, color: COLORS.cyan, letterSpacing: '.08em', marginBottom: 8, textTransform: 'uppercase' }}>Nova caixa / volume</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <input className="cp-input" placeholder="Nome (ex: Caixa A)" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6 }}>
+                <input className="cp-input" type="number" placeholder="C" value={form.L} onChange={(e) => setForm({ ...form, L: e.target.value })} />
+                <input className="cp-input" type="number" placeholder="L" value={form.W} onChange={(e) => setForm({ ...form, W: e.target.value })} />
+                <input className="cp-input" type="number" placeholder="A" value={form.H} onChange={(e) => setForm({ ...form, H: e.target.value })} />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                <input className="cp-input" type="number" placeholder="Qtd" value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} />
+                <input className="cp-input" type="number" placeholder="Peso un. (kg)" value={form.weight} onChange={(e) => setForm({ ...form, weight: e.target.value })} />
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button className="cp-btn" style={{ flex: 1, background: editingId != null ? COLORS.ok : COLORS.accent, color: '#0b131c' }} onClick={submitBoxType}>
+                  {editingId != null ? <Save size={14} /> : <Plus size={14} />} {editingId != null ? 'Salvar edição' : 'Adicionar'}
+                </button>
+                {editingId != null && (
+                  <button className="cp-btn" style={{ background: COLORS.panelAlt, color: COLORS.textDim, border: `1px solid ${COLORS.line}` }} onClick={cancelEdit}>
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* box type list */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {boxTypes.map((bt) => (
+              <div key={bt.id} style={{ display: 'flex', alignItems: 'center', gap: 8, background: editingId === bt.id ? 'rgba(79,214,168,0.08)' : COLORS.panelAlt, border: `1px solid ${editingId === bt.id ? COLORS.ok : COLORS.line}`, borderRadius: 4, padding: '6px 8px' }}>
+                <div style={{ width: 10, height: 10, borderRadius: 2, background: bt.color, flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{bt.name}</div>
+                  <div style={{ fontSize: 10, color: COLORS.textDim, fontFamily: 'ui-monospace, monospace' }}>
+                    {bt.L}×{bt.W}×{bt.H}cm · {bt.qty}un
+                  </div>
+                </div>
+                <Pencil size={14} color={COLORS.textDim} style={{ cursor: 'pointer' }} onClick={() => startEditBoxType(bt)} />
+                <Trash2 size={14} color={COLORS.textDim} style={{ cursor: 'pointer' }} onClick={() => removeBoxType(bt.id)} />
+              </div>
+            ))}
+            {boxTypes.length === 0 && <div style={{ fontSize: 12, color: COLORS.textDim, fontStyle: 'italic' }}>Nenhum volume adicionado ainda.</div>}
+          </div>
+
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="cp-btn" style={{ flex: 1, background: COLORS.cyan, color: '#0b131c' }} onClick={autoArrange} disabled={boxTypes.length === 0}>
+              <Ruler size={14} /> Auto-organizar
+            </button>
+            <button className="cp-btn" style={{ background: COLORS.panelAlt, color: COLORS.textDim, border: `1px solid ${COLORS.line}` }} onClick={resetAll}>
+              <RotateCcw size={14} />
+            </button>
+          </div>
+
+          {/* stats */}
+          {placed.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, paddingTop: 6, borderTop: `1px solid ${COLORS.line}` }}>
+              {!truck.knowTruck && (
+                <div style={{ background: COLORS.panelAlt, border: `1px solid ${COLORS.line}`, borderRadius: 4, padding: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div style={{ fontSize: 10, color: COLORS.textDim, textTransform: 'uppercase', letterSpacing: '.06em' }}>Pré-medida da carga</div>
+                  <div style={{ fontSize: 13, fontFamily: 'ui-monospace, monospace' }}>
+                    Comprimento necessário: <b style={{ color: COLORS.accent2 }}>~{fmt(neededLength)} cm</b>
+                  </div>
+                  <div style={{ fontSize: 11, color: COLORS.textDim, fontFamily: 'ui-monospace, monospace' }}>
+                    (com {fmt(truck.W)}×{fmt(truck.H)}cm de largura/altura) · vol. {fmt(usedVolume)} m³ · {fmt(totalWeight)} kg
+                  </div>
+                  <button className="cp-btn" style={{ background: COLORS.accent, color: '#0b131c', marginTop: 2 }} onClick={useNeededAsTruck}>
+                    Usar essa medida e definir caminhão
+                  </button>
+                </div>
+              )}
+
+              {truck.knowTruck && (
+                <>
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
+                      <span style={{ color: COLORS.textDim }}>Volume ocupado{occLen > 0 ? ' (reservado + novo)' : ''}</span>
+                      <span style={{ fontFamily: 'ui-monospace, monospace' }}>{fmt(usedVolume + occVolume)} / {fmt(truckVolume)} m³</span>
+                    </div>
+                    <div style={{ height: 6, background: COLORS.panelAlt, borderRadius: 3, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', width: `${utilization}%`, background: COLORS.ok }} />
+                    </div>
+                  </div>
+                  {showWeightLimit ? (
+                    <div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
+                        <span style={{ color: COLORS.textDim }}>Peso</span>
+                        <span style={{ fontFamily: 'ui-monospace, monospace' }}>{fmt(totalWeight)} / {fmt(truck.maxWeight)} kg</span>
+                      </div>
+                      <div style={{ height: 6, background: COLORS.panelAlt, borderRadius: 3, overflow: 'hidden' }}>
+                        <div style={{ height: '100%', width: `${weightPct}%`, background: weightPct > 100 ? COLORS.danger : COLORS.accent2 }} />
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 11, color: COLORS.textDim, fontFamily: 'ui-monospace, monospace' }}>Peso total: {fmt(totalWeight)} kg</div>
+                  )}
+                  {unplaced.length > 0 && (
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'flex-start', fontSize: 11, color: COLORS.danger, background: 'rgba(255,92,92,0.08)', border: `1px solid ${COLORS.danger}`, borderRadius: 4, padding: 8 }}>
+                      <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+                      <span>{unplaced.length} volume(s) não couberam no baú com o arranjo atual.</span>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* main view */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+          <div style={{ display: 'flex', gap: 4, padding: '10px 16px 0', background: COLORS.bg, alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', gap: 4 }}>
+              <div className="cp-tab" style={{ background: view === '3d' ? COLORS.panelAlt : 'transparent', color: view === '3d' ? COLORS.text : COLORS.textDim }} onClick={() => setView('3d')}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><Move3d size={13} /> 3D</span>
+              </div>
+              <div className="cp-tab" style={{ background: view === '2d' ? COLORS.panelAlt : 'transparent', color: view === '2d' ? COLORS.text : COLORS.textDim }} onClick={() => setView('2d')}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><Layers size={13} /> 2D (arrastar)</span>
+              </div>
+            </div>
+            {view === '2d' && placed.length > 0 && (
+              <div style={{ fontSize: 11, color: COLORS.textDim, paddingRight: 4 }}>arraste sobre outra p/ empilhar · toque no ⟳ p/ girar 90° · solte livre p/ pousar no chão</div>
+            )}
+          </div>
+
+          <div style={{ flex: 1, background: COLORS.panelAlt, margin: '0 16px 16px', borderRadius: 6, border: `1px solid ${COLORS.line}`, overflow: 'hidden', position: 'relative', minHeight: 380 }}>
+            {placed.length === 0 ? (
+              <div style={{ height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, color: COLORS.textDim }}>
+                <BoxIcon size={28} />
+                <div style={{ fontSize: 13 }}>Adicione os volumes e clique em "Auto-organizar"</div>
+              </div>
+            ) : view === '3d' ? (
+              <ThreeView truck={truck} placed={placed} occupiedLength={occLen} knowTruck={truck.knowTruck} />
+            ) : (
+              <FloorPlan truck={truck} placed={placed} setPlaced={setPlaced} occupiedLength={occLen} knowTruck={truck.knowTruck} />
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<CargoPlanner />);
+</script>
+</body>
+</html>
